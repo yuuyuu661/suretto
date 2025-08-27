@@ -57,7 +57,9 @@ _links_lock = asyncio.Lock()
 _links: Dict[str, List[int]] = {}
 
 def _ensure_dir(path: str):
-    os.makedirs(os.path.dirname(path), exist_ok=True) if os.path.dirname(path) else None
+    dirpath = os.path.dirname(path)
+    if dirpath:
+        os.makedirs(dirpath, exist_ok=True)
 
 def load_links():
     global _links
@@ -113,9 +115,9 @@ async def find_existing_user_thread(forum: discord.ForumChannel, display_name: s
     for t in forum.threads:
         if name_belongs_to_user(t.name, display_name):
             return t
-    # アーカイブ済み
+    # アーカイブ済み（※ private 引数は不要）
     try:
-        async for t in forum.archived_threads(limit=200, private=False):
+        async for t in forum.archived_threads(limit=200):
             if name_belongs_to_user(t.name, display_name):
                 return t
     except Exception:
@@ -192,10 +194,11 @@ async def on_message(message: discord.Message):
                 content=content,
                 reason=f"Triggered by message in #{message.channel.name} from {member} ({member.id})",
             )
-            # 紐付け保存（後でソース削除時にスレも削除）
-            await add_link(message.id, created.id)
+            # create_thread は ThreadWithMessage を返す → thread を取り出す
+            thread_obj = created.thread if hasattr(created, "thread") else created
+            await add_link(message.id, thread_obj.id)
 
-            log.info(f"[OK] Created thread: {created.name} (ID: {created.id}) in forum '{forum.name}'")
+            log.info(f"[OK] Created thread: {thread_obj.name} (ID: {thread_obj.id}) in forum '{forum.name}'")
         except discord.Forbidden:
             log.exception(f"[NG] 権限不足で作成失敗: forum '{forum.name}'")
         except discord.HTTPException:
@@ -214,16 +217,13 @@ async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
     if not thread_ids:
         return
 
-    # thread を削除
     for tid in thread_ids:
         try:
-            # fetch_channel は Thread を返す（存在しない/既に削除済みなら例外）
-            ch = await bot.fetch_channel(tid)
+            ch = await bot.fetch_channel(tid)  # Thread を取得
             if isinstance(ch, discord.Thread):
                 await ch.delete(reason=f"Source message {msg_id} deleted; auto-clean thread.")
                 log.info(f"[OK] Deleted thread {tid} due to source message deletion.")
         except discord.NotFound:
-            # 既に削除されている
             log.info(f"[Skip] Thread {tid} not found (already deleted?).")
         except discord.Forbidden:
             log.exception(f"[NG] 権限不足でスレッド削除失敗: thread {tid}")
