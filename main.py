@@ -1,8 +1,10 @@
 import os
+import json
 import logging
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from typing import List, Set
+from typing import List, Set, Dict
+import asyncio
 
 import discord
 from discord.ext import commands
@@ -27,6 +29,9 @@ MALE_FORUM_IDS: List[int] = parse_id_list("MALE_FORUM_IDS")
 FEMALE_FORUM_IDS: List[int] = parse_id_list("FEMALE_FORUM_IDS")
 DEFAULT_FORUM_IDS: List[int] = parse_id_list("DEFAULT_FORUM_IDS")  # 任意
 
+# スレッドリンク保存先（JSON）
+THREAD_LINKS_FILE = os.getenv("THREAD_LINKS_FILE", "data/thread_links.json")
+
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 # ========= ログ =========
@@ -39,11 +44,57 @@ log = logging.getLogger("forum-post-maker")
 # ========= Bot/Intents =========
 intents = discord.Intents.default()
 intents.guilds = True
-intents.messages = True   # on_message 用
-intents.members = True    # ロール判定に必要（Dev Portalで Server Members Intent をON）
+intents.messages = True           # on_message 用
+intents.members = True            # ロール判定（Dev Portal で Server Members Intent をON）
+intents.message_content = False   # 内容は使わない
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 JST = ZoneInfo("Asia/Tokyo")
+
+# ========= 永続化（メッセージ→スレッド紐付け） =========
+_links_lock = asyncio.Lock()
+# 形式: { "<message_id>": [<thread_id>, ...] }
+_links: Dict[str, List[int]] = {}
+
+def _ensure_dir(path: str):
+    os.makedirs(os.path.dirname(path), exist_ok=True) if os.path.dirname(path) else None
+
+def load_links():
+    global _links
+    try:
+        if os.path.exists(THREAD_LINKS_FILE):
+            with open(THREAD_LINKS_FILE, "r", encoding="utf-8") as f:
+                _links = json.load(f)
+        else:
+            _links = {}
+    except Exception:
+        log.exception("リンクファイルの読み込みに失敗しました。初期化します。")
+        _links = {}
+
+def save_links():
+    _ensure_dir(THREAD_LINKS_FILE)
+    try:
+        with open(THREAD_LINKS_FILE, "w", encoding="utf-8") as f:
+            json.dump(_links, f, ensure_ascii=False, indent=2)
+    except Exception:
+        log.exception("リンクファイルの保存に失敗しました。")
+
+async def add_link(message_id: int, thread_id: int):
+    async with _links_lock:
+        key = str(message_id)
+        _links.setdefault(key, [])
+        if thread_id not in _links[key]:
+            _links[key].append(thread_id)
+            save_links()
+
+async def pop_links(message_id: int) -> List[int]:
+    """削除時に対応スレッドID群を取り出す（なければ空）。"""
+    async with _links_lock:
+        key = str(message_id)
+        ids = _links.pop(key, [])
+        if ids:
+            save_links()
+        return ids
 
 # ========= ユーティリティ =========
 def make_thread_name(display_name: str, base_time: datetime) -> str:
@@ -58,11 +109,10 @@ def name_belongs_to_user(thread_name: str, display_name: str) -> bool:
 
 async def find_existing_user_thread(forum: discord.ForumChannel, display_name: str) -> discord.Thread | None:
     """同ユーザー名先頭のスレッドがそのフォーラムにあるか（アクティブ＋アーカイブ）"""
-    # アクティブスレッド
+    # アクティブ
     for t in forum.threads:
         if name_belongs_to_user(t.name, display_name):
             return t
-
     # アーカイブ済み
     try:
         async for t in forum.archived_threads(limit=200, private=False):
@@ -100,9 +150,12 @@ def gather_target_forums(guild: discord.Guild, member: discord.Member) -> List[d
 # ========= イベント =========
 @bot.event
 async def on_ready():
+    load_links()
     log.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
     log.info(f"監視対象テキスト: {SOURCE_TEXT_CHANNEL_IDS}")
     log.info(f"男性フォーラム: {MALE_FORUM_IDS} / 女性フォーラム: {FEMALE_FORUM_IDS} / デフォルト: {DEFAULT_FORUM_IDS}")
+    if not SOURCE_TEXT_CHANNEL_IDS:
+        log.warning("SOURCE_TEXT_CHANNEL_IDS が未設定です。")
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -124,7 +177,7 @@ async def on_message(message: discord.Message):
         base_time = base_time.replace(tzinfo=JST)
 
     thread_name = make_thread_name(display_name, base_time)
-    content = message.jump_url  # ← ご要望どおり「リンクのみ」
+    content = message.jump_url  # ← リンクのみ
 
     for forum in forums:
         try:
@@ -139,13 +192,45 @@ async def on_message(message: discord.Message):
                 content=content,
                 reason=f"Triggered by message in #{message.channel.name} from {member} ({member.id})",
             )
-            log.info(f"[OK] Created thread: {created.name} in forum '{forum.name}'")
+            # 紐付け保存（後でソース削除時にスレも削除）
+            await add_link(message.id, created.id)
+
+            log.info(f"[OK] Created thread: {created.name} (ID: {created.id}) in forum '{forum.name}'")
         except discord.Forbidden:
             log.exception(f"[NG] 権限不足で作成失敗: forum '{forum.name}'")
         except discord.HTTPException:
             log.exception(f"[NG] HTTPエラーで作成失敗: forum '{forum.name}'")
         except Exception:
             log.exception(f"[NG] 想定外のエラー: forum '{forum.name}'")
+
+@bot.event
+async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
+    """
+    メッセージが削除されたら、紐付いたスレッドを削除。
+    Raw イベントなので、キャッシュに無いメッセージでも反応可能。
+    """
+    msg_id = payload.message_id
+    thread_ids = await pop_links(msg_id)
+    if not thread_ids:
+        return
+
+    # thread を削除
+    for tid in thread_ids:
+        try:
+            # fetch_channel は Thread を返す（存在しない/既に削除済みなら例外）
+            ch = await bot.fetch_channel(tid)
+            if isinstance(ch, discord.Thread):
+                await ch.delete(reason=f"Source message {msg_id} deleted; auto-clean thread.")
+                log.info(f"[OK] Deleted thread {tid} due to source message deletion.")
+        except discord.NotFound:
+            # 既に削除されている
+            log.info(f"[Skip] Thread {tid} not found (already deleted?).")
+        except discord.Forbidden:
+            log.exception(f"[NG] 権限不足でスレッド削除失敗: thread {tid}")
+        except discord.HTTPException:
+            log.exception(f"[NG] HTTPエラーでスレッド削除失敗: thread {tid}")
+        except Exception:
+            log.exception(f"[NG] 想定外のエラー: thread {tid}")
 
 # ========= 起動 =========
 if __name__ == "__main__":
